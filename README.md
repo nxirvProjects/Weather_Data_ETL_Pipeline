@@ -1,6 +1,6 @@
 # Weather Data Pipeline
 
-An ELT pipeline that fetches weather data from the Weatherstack API, loads it into PostgreSQL, and uses Apache Airflow to run it automatically on a schedule. dbt transformations will be added next.
+An ELT pipeline that fetches weather data from the Weatherstack API, loads it into PostgreSQL, uses Apache Airflow to run it automatically on a schedule, and uses dbt to clean and transform the data.
 
 ## Pipeline Overview
 
@@ -20,8 +20,16 @@ weather-data-project/
 │   └── dags/
 │       └── orchestrator.py  # Airflow DAG that runs the pipeline on a schedule
 ├── dbt/
-│   ├── profiles.yml         # dbt connection config (points to Postgres)
-│   └── my_project/          # dbt project (models, sources, etc.)
+│   ├── profiles.yml                        # dbt connection config (points to Postgres)
+│   └── my_project/
+│       └── models/
+│           ├── sources/
+│           │   └── sources.yml             # declares raw_weather_data as a dbt source
+│           ├── staging/
+│           │   └── stg_weather_data.sql    # deduplicates raw data, converts timestamps
+│           └── mart/
+│               ├── weather_report.sql      # final clean weather table for reporting
+│               └── daily_average.sql       # daily avg temperature and wind speed per city
 ├── postgres/
 │   └── airflow_init.sql     # sets up the airflow database on first run
 ├── docker-compose.yaml      # defines the Postgres, Airflow, and dbt containers
@@ -50,9 +58,12 @@ POSTGRES_PASSWORD=db_password
 docker compose up
 ```
 
-This starts two containers:
+This starts three containers (one per service declared in `docker-compose.yaml`):
 - **postgres_container** — the PostgreSQL database (accessible on port 5000 from your machine)
 - **airflow_container** — Apache Airflow (accessible at http://localhost:8000)
+- **dbt_container** — dbt for transforming the raw data
+
+All three containers are connected via `my-network`, a private Docker network defined at the bottom of `docker-compose.yaml`. Without it, containers can't talk to each other. Because they share this network, Airflow can reach Postgres using just the service name `db` — which is why `insert_records.py` connects to `host="db"` instead of `localhost`.
 
 ### 4. Open the Airflow UI
 Go to http://localhost:8000 in your browser. The DAG `weather-api-orchestrator` will appear and run automatically every 5 minutes.
@@ -86,6 +97,76 @@ sudo chmod -R 770 ./dbt
 docker compose run dbt debug
 ```
 You should see `Connection test: OK` if everything is set up correctly.
+
+### 6. Run dbt models
+
+Once Airflow has run the DAG and data is in Postgres, trigger dbt manually:
+```bash
+docker compose run dbt run
+```
+
+This runs all three models in order:
+
+**`stg_weather_data.sql` (staging)**
+Reads from `dev.raw_weather_data` and:
+- Deduplicates rows using `row_number()` — since Airflow runs every 5 minutes with mock data, the same weather snapshot gets inserted repeatedly. This keeps only the first insert per unique `time` value.
+- Converts `inserted_at` from UTC to the city's local time using the `utc_offset` column.
+
+**`weather_report.sql` (mart)**
+Reads from `stg_weather_data` and produces a clean, simple table with just the columns useful for reporting: city, temperature, weather description, wind speed, and local time.
+
+**`daily_average.sql` (mart)**
+Reads from `stg_weather_data` and calculates the average temperature and wind speed per city per day — useful for trend analysis and dashboards.
+
+**To verify the models ran correctly, check in psql:**
+```sql
+select * from dev.stg_weather_data limit 10;
+select * from dev.weather_report limit 10;
+select * from dev.daily_average;
+```
+
+**To see raw data with duplicate row numbers before deduplication:**
+```sql
+select
+    *,
+    row_number() over (partition by time order by inserted_at) as rn
+from dev.raw_weather_data;
+```
+
+---
+
+## Docker Concepts
+
+### What is Docker?
+Instead of installing Postgres and Airflow directly on your laptop, Docker runs them in **containers** — isolated environments that have everything pre-installed. You just declare what you want and Docker handles the rest.
+
+- **Docker Desktop** = the engine that runs containers (the oven)
+- **docker-compose.yaml** = the config file that tells Docker what to run (the recipe)
+
+### What is docker-compose.yaml?
+Every `service` declared in the file becomes one container. You're not writing any logic — just describing:
+- **What** to run (image + version)
+- **How** to configure it (ports, environment variables)
+- **What files** to mount into it (volumes)
+- **How containers connect** to each other (networks)
+
+### What are volumes?
+Volumes link a folder on your laptop to a folder inside a container so they stay in sync:
+```yaml
+- ./airflow/dags:/opt/airflow/dags
+```
+- Left side = folder on your laptop
+- Right side = folder inside the container
+
+When you edit a file on your laptop, the container sees it instantly. This is also why Postgres data survives `docker compose down` — it's stored on your laptop, not inside the container. Running `docker compose down -v` deletes the volume and wipes the data.
+
+### What is the network?
+By default containers are isolated and can't talk to each other. `my-network` puts all containers on the same private internal network so they can communicate using service names.
+
+That's why `insert_records.py` connects to `host="db"` — both Airflow and Postgres are on `my-network`, so Airflow can reach Postgres just by using the name `db`.
+
+### What is YAML?
+YAML (`.yml` or `.yaml` — same thing, different extension) is a format designed to be easy for humans to read and write. Docker Compose, Airflow, and dbt all use it for config files because it's cleaner than JSON — no brackets or quotes needed.
 
 ---
 
